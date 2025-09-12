@@ -2335,42 +2335,44 @@ async def debug_race_mapping(interaction: discord.Interaction):
 
     await interaction.followup.send(embed=embed)
 
+
 @app_commands.command(name="scanmatches", description="[ADMIN] Scan leaderboards to collect match data")
 @app_commands.describe(passcode="Admin passcode required")
 async def slash_scan_matches(interaction: discord.Interaction, passcode: str):
-    if passcode != ADMIN_PASSCODE:
-        await interaction.response.send_message("❌ Invalid passcode.", ephemeral=True)
-        return
-
+    # Defer immediately to prevent timeout
     await interaction.response.defer()
 
+    # Check passcode after deferring
+    if passcode != ADMIN_PASSCODE:
+        await interaction.followup.send("❌ Invalid passcode.", ephemeral=True)
+        return
 
+    # Create initial embed
     embed = discord.Embed(title="🔍 Match Data Scan Starting", color=0xFFA500)
     embed.description = "Scanning leaderboards to discover players and collect match histories..."
     embed.add_field(name="Status", value="Initializing...", inline=False)
 
     message = await interaction.followup.send(embed=embed)
 
-
+    # Progress update function
     async def update_progress(status_text):
         try:
             embed.set_field_at(0, name="Status", value=status_text, inline=False)
             await message.edit(embed=embed)
-        except:
-            pass
+        except Exception as e:
+            print(f"Error updating progress: {e}")
 
     start_time = datetime.now()
 
     try:
-
+        # Run the scan
         results = await bulk_scan_for_matches(update_progress)
 
         end_time = datetime.now()
         duration = (end_time - start_time).total_seconds()
 
-
+        # Create results embed
         results_embed = discord.Embed(title="✅ Match Scan Complete", color=0x00FF00)
-
 
         results_embed.add_field(
             name="📊 Summary",
@@ -2381,7 +2383,6 @@ async def slash_scan_matches(interaction: discord.Interaction, passcode: str):
                   f"**Duration:** {duration:.1f} seconds",
             inline=False
         )
-
 
         if results['leaderboard_results']:
             leaderboard_text = []
@@ -2394,7 +2395,6 @@ async def slash_scan_matches(interaction: discord.Interaction, passcode: str):
                 inline=False
             )
 
-
         total_stored_matches = get_stored_match_count()
         total_known_players = len(player_aliases)
 
@@ -2404,7 +2404,6 @@ async def slash_scan_matches(interaction: discord.Interaction, passcode: str):
                   f"**Known Players:** {total_known_players}",
             inline=True
         )
-
 
         players_per_second = results['total_players_processed'] / duration if duration > 0 else 0
         matches_per_second = results['total_matches_added'] / duration if duration > 0 else 0
@@ -2423,7 +2422,176 @@ async def slash_scan_matches(interaction: discord.Interaction, passcode: str):
     except Exception as e:
         error_embed = discord.Embed(title="❌ Match Scan Failed", color=0xFF0000)
         error_embed.description = f"An error occurred during the scan: {str(e)}"
-        await message.edit(embed=error_embed)
+        error_embed.add_field(name="Error Details", value=f"```{str(e)[:1000]}```", inline=False)
+        try:
+            await message.edit(embed=error_embed)
+        except:
+            await interaction.followup.send(embed=error_embed)
+
+
+
+@app_commands.command(name="topelo", description="Show top ranked players by ELO across all factions (Top 200 only)")
+@app_commands.describe(
+    limit="Number of top players to show (default: 10, max: 20)",
+    min_games="Minimum games required to be ranked (default: 10)"
+)
+async def slash_topelo(interaction: discord.Interaction, limit: int = 10, min_games: int = 10):
+    # Defer immediately
+    await interaction.response.defer()
+
+    # Validate parameters
+    if limit < 1 or limit > 20:
+        await interaction.followup.send("Limit must be between 1 and 20.", ephemeral=True)
+        return
+
+    if min_games < 0:
+        await interaction.followup.send("Minimum games must be 0 or greater.", ephemeral=True)
+        return
+
+    try:
+        top_players = await topelo(limit=limit, min_games=min_games)
+
+        if not top_players:
+            await interaction.followup.send("No top 200 ranked players found meeting the criteria.")
+            return
+
+        title = f"🏆 Top {len(top_players)} ELO Players (Top 200 Ranked Only)"
+        embed = await format_topelo_embed(top_players, title)
+
+        embed.description = (f"Top {len(top_players)} ranked players by highest ELO (ranks 1-200 only)\n"
+                             f"**Faction Leaders:** 😈Chaos 🗡️Dark Eldar ✨Eldar 🛡️Guard 🤖Necron 💪Orc 🔥Sisters ⭐Space Marine 🎯Tau")
+
+        footer_text = (
+            f"Minimum games: {min_games} • Top 200 ranked players only • Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        embed.set_footer(text=footer_text)
+
+        await interaction.followup.send(embed=embed)
+
+    except Exception as e:
+        print(f"Error in topelo command: {e}")
+        await interaction.followup.send(f"An error occurred while fetching top ELO data: {str(e)}", ephemeral=True)
+
+
+# Additional error
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    """Global error handler for slash commands"""
+
+    if isinstance(error, app_commands.CommandOnCooldown):
+        await interaction.response.send_message(
+            f"Command is on cooldown. Try again in {error.retry_after:.2f} seconds.",
+            ephemeral=True
+        )
+    elif isinstance(error, app_commands.CommandInvokeError):
+        print(f"Command error: {error}")
+
+        # Try to respond
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "An error occurred while processing your command. Please try again.",
+                    ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    "An error occurred while processing your command. Please try again.",
+                    ephemeral=True
+                )
+        except Exception as e:
+            print(f"Failed to send error message: {e}")
+    else:
+        print(f"Unhandled command error: {error}")
+
+
+class ConnectionManager:
+    __slots__ = ['_session', '_lock', '_retry_count']
+
+    def __init__(self):
+        self._session = None
+        self._lock = asyncio.Lock()
+        self._retry_count = 0
+
+    async def get_session(self):
+        if self._session is None or self._session.closed:
+            async with self._lock:
+                if self._session is None or self._session.closed:
+                    await self._create_session()
+        return self._session
+
+    async def _create_session(self):
+        if self._session and not self._session.closed:
+            try:
+                await self._session.close()
+            except Exception as e:
+                print(f"Error closing session: {e}")
+
+        timeout = aiohttp.ClientTimeout(total=30, connect=10)
+        connector = aiohttp.TCPConnector(
+            limit=10,
+            limit_per_host=5,
+            ttl_dns_cache=300,
+            use_dns_cache=True,
+            enable_cleanup_closed=True,
+            keepalive_timeout=30
+        )
+
+        try:
+            self._session = aiohttp.ClientSession(
+                timeout=timeout,
+                connector=connector,
+                headers={'User-Agent': 'Discord-Bot/2.0'}
+            )
+            self._retry_count = 0
+            logger.info("Created new HTTP session")
+        except Exception as e:
+            logger.error(f"Failed to create HTTP session: {e}")
+            self._retry_count += 1
+            if self._retry_count < 3:
+                await asyncio.sleep(1)
+                await self._create_session()
+            else:
+                raise
+
+    async def close(self):
+        if self._session and not self._session.closed:
+            try:
+                await self._session.close()
+                logger.info("HTTP session closed")
+            except Exception as e:
+                logger.error(f"Error closing HTTP session: {e}")
+
+
+
+async def fetch_json(url: str, max_retries: int = 3) -> dict:
+    for attempt in range(max_retries):
+        try:
+            session = await connection_manager.get_session()
+            async with session.get(url) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return data
+                elif response.status == 429:
+                    wait_time = 2 ** attempt
+                    logger.warning(f"Rate limited, waiting {wait_time}s before retry {attempt + 1}")
+                    await asyncio.sleep(wait_time)
+                    continue
+                else:
+                    logger.warning(f"HTTP {response.status} for {url}")
+                    if attempt == max_retries - 1:
+                        return {}
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout on attempt {attempt + 1} for {url}")
+            if attempt == max_retries - 1:
+                return {}
+        except Exception as e:
+            logger.error(f"HTTP request failed on attempt {attempt + 1}: {e}")
+            if attempt == max_retries - 1:
+                return {}
+
+
+        await asyncio.sleep(1)
+
+    return {}
 
 
 @app_commands.command(name="matchstats", description="Show statistics about stored match data")
