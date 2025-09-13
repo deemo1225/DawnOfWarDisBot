@@ -12,7 +12,9 @@ from typing import Dict, Optional, Tuple, List, Set
 from dataclasses import dataclass
 import os
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
+from typing import Optional
+
 
 logger = logging.getLogger(__name__)
 
@@ -49,11 +51,12 @@ BASE_URL = 'https://dow-api.reliclink.com/community/leaderboard'
 
 
 class ConnectionManager:
-    __slots__ = ['_session', '_lock']
+    __slots__ = ['_session', '_lock', '_retry_count']
 
     def __init__(self):
         self._session = None
         self._lock = asyncio.Lock()
+        self._retry_count = 0
 
     async def get_session(self):
         if self._session is None or self._session.closed:
@@ -64,35 +67,273 @@ class ConnectionManager:
 
     async def _create_session(self):
         if self._session and not self._session.closed:
-            await self._session.close()
+            try:
+                await self._session.close()
+            except Exception as e:
+                logger.warning(f"Error closing old session: {e}")
 
-        timeout = aiohttp.ClientTimeout(total=30, connect=10)
+        # More conservative timeout settings
+        timeout = aiohttp.ClientTimeout(total=45, connect=15, sock_read=30)
         connector = aiohttp.TCPConnector(
-            limit=10,
-            limit_per_host=5,
-            ttl_dns_cache=300,
+            limit=20,
+            limit_per_host=10,
+            ttl_dns_cache=600,
             use_dns_cache=True,
             enable_cleanup_closed=True,
-            keepalive_timeout=30
+            keepalive_timeout=45
         )
 
-        self._session = aiohttp.ClientSession(
-            timeout=timeout,
-            connector=connector,
-            headers={'User-Agent': 'Discord-Bot/2.0'}
-        )
-
-        logger.info("Created new HTTP session")
+        try:
+            self._session = aiohttp.ClientSession(
+                timeout=timeout,
+                connector=connector,
+                headers={'User-Agent': 'Discord-Bot/2.0'},
+                raise_for_status=False
+            )
+            self._retry_count = 0
+            logger.info("Created new HTTP session with improved settings")
+        except Exception as e:
+            logger.error(f"Failed to create HTTP session: {e}")
+            self._retry_count += 1
+            if self._retry_count < 3:
+                await asyncio.sleep(min(2 ** self._retry_count, 10))
+                await self._create_session()
+            else:
+                raise
 
     async def close(self):
         if self._session and not self._session.closed:
-            await self._session.close()
-            logger.info("HTTP session closed")
-
+            try:
+                await self._session.close()
+                logger.info("HTTP session closed")
+            except Exception as e:
+                logger.error(f"Error closing HTTP session: {e}")
 
 connection_manager = ConnectionManager()
 
 
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    """Enhanced global error handler for slash commands"""
+
+    if isinstance(error, app_commands.CommandOnCooldown):
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    f"Command is on cooldown. Try again in {error.retry_after:.2f} seconds.",
+                    ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    f"Command is on cooldown. Try again in {error.retry_after:.2f} seconds.",
+                    ephemeral=True
+                )
+        except discord.NotFound:
+            print(f"Interaction expired for cooldown error: {error}")
+        except Exception as e:
+            print(f"Failed to send cooldown message: {e}")
+
+    elif isinstance(error, app_commands.CommandInvokeError):
+        print(f"Command error: {error}")
+
+        # Check if it's a Discord API error
+        if isinstance(error.original, (discord.NotFound, discord.HTTPException)):
+            print(f"Discord API error (interaction likely expired): {error.original}")
+            return  # Don't try to respond to expired interactions
+
+        try:
+            error_msg = "An error occurred while processing your command. Please try again."
+
+            if not interaction.response.is_done():
+                await interaction.response.send_message(error_msg, ephemeral=True)
+            else:
+                await interaction.followup.send(error_msg, ephemeral=True)
+
+        except discord.NotFound:
+            print(f"Could not respond to interaction - likely expired: {interaction.id}")
+        except Exception as e:
+            print(f"Failed to send error message: {e}")
+    else:
+        print(f"Unhandled command error: {error}")
+
+async def safe_interaction_response(interaction: discord.Interaction, content=None, embed=None, ephemeral=False):
+    """Safely respond to interactions with timeout handling"""
+    try:
+        if not interaction.response.is_done():
+            if embed:
+                await interaction.response.send_message(embed=embed, ephemeral=ephemeral)
+            else:
+                await interaction.response.send_message(content, ephemeral=ephemeral)
+            return True
+        else:
+            if embed:
+                await interaction.followup.send(embed=embed, ephemeral=ephemeral)
+            else:
+                await interaction.followup.send(content, ephemeral=ephemeral)
+            return True
+    except discord.NotFound:
+        print(f"Interaction {interaction.id} has expired")
+        return False
+    except discord.HTTPException as e:
+        print(f"HTTP error responding to interaction: {e}")
+        return False
+    except Exception as e:
+        print(f"Unexpected error responding to interaction: {e}")
+        return False
+
+# Safe followup wrapper
+async def safe_followup_send(interaction: discord.Interaction, content=None, embed=None, ephemeral=False):
+    """Safely send followup messages with timeout handling"""
+    try:
+        if embed:
+            await interaction.followup.send(embed=embed, ephemeral=ephemeral)
+        else:
+            await interaction.followup.send(content, ephemeral=ephemeral)
+        return True
+    except discord.NotFound:
+        print(f"Interaction {interaction.id} has expired for followup")
+        return False
+    except discord.HTTPException as e:
+        print(f"HTTP error in followup: {e}")
+        return False
+    except Exception as e:
+        print(f"Unexpected error in followup: {e}")
+        return False
+
+# progress tracking for long operations
+class ProgressTracker:
+    def __init__(self, interaction: discord.Interaction, title: str):
+        self.interaction = interaction
+        self.title = title
+        self.message = None
+        self.last_update = None
+        self.is_valid = True
+
+    async def initialize(self):
+        """Initialize the progress message"""
+        embed = discord.Embed(title=self.title, color=0xFFA500)
+        embed.add_field(name="Status", value="Initializing...", inline=False)
+
+        try:
+            if not self.interaction.response.is_done():
+                await self.interaction.response.send_message(embed=embed)
+                self.message = await self.interaction.original_response()
+            else:
+                self.message = await self.interaction.followup.send(embed=embed)
+            self.last_update = datetime.now()
+            return True
+        except discord.NotFound:
+            print("Interaction expired during progress initialization")
+            self.is_valid = False
+            return False
+        except Exception as e:
+            print(f"Error initializing progress: {e}")
+            self.is_valid = False
+            return False
+
+    async def update(self, status_text: str, force: bool = False):
+        """Update progress with rate limiting"""
+        if not self.is_valid or not self.message:
+            return False
+
+        # Rate limit updates to every 2 seconds unless forced
+        now = datetime.now()
+        if not force and self.last_update and (now - self.last_update).total_seconds() < 2:
+            return True
+
+        try:
+            embed = discord.Embed(title=self.title, color=0xFFA500)
+            embed.add_field(name="Status", value=status_text, inline=False)
+            await self.message.edit(embed=embed)
+            self.last_update = now
+            return True
+        except discord.NotFound:
+            print("Progress message or interaction expired")
+            self.is_valid = False
+            return False
+        except discord.HTTPException as e:
+            print(f"HTTP error updating progress: {e}")
+            if e.status == 404:
+                self.is_valid = False
+            return False
+        except Exception as e:
+            print(f"Unexpected error updating progress: {e}")
+            return False
+
+    async def finish(self, embed: discord.Embed):
+        """Finish with final results"""
+        if not self.is_valid or not self.message:
+            return False
+
+        try:
+            await self.message.edit(embed=embed)
+            return True
+        except discord.NotFound:
+            print("Cannot update progress - message/interaction expired")
+            return False
+        except Exception as e:
+            print(f"Error finishing progress: {e}")
+            return False
+
+# ConnectionManager class
+class ConnectionManager:
+    __slots__ = ['_session', '_lock', '_retry_count']
+
+    def __init__(self):
+        self._session = None
+        self._lock = asyncio.Lock()
+        self._retry_count = 0
+
+    async def get_session(self):
+        if self._session is None or self._session.closed:
+            async with self._lock:
+                if self._session is None or self._session.closed:
+                    await self._create_session()
+        return self._session
+
+    async def _create_session(self):
+        if self._session and not self._session.closed:
+            try:
+                await self._session.close()
+            except Exception as e:
+                logger.warning(f"Error closing old session: {e}")
+
+        # More conservative timeout settings
+        timeout = aiohttp.ClientTimeout(total=45, connect=15, sock_read=30)
+        connector = aiohttp.TCPConnector(
+            limit=20,
+            limit_per_host=10,
+            ttl_dns_cache=600,
+            use_dns_cache=True,
+            enable_cleanup_closed=True,
+            keepalive_timeout=45
+        )
+
+        try:
+            self._session = aiohttp.ClientSession(
+                timeout=timeout,
+                connector=connector,
+                headers={'User-Agent': 'Discord-Bot/2.0'},
+                raise_for_status=False
+            )
+            self._retry_count = 0
+            logger.info("Created new HTTP session with improved settings")
+        except Exception as e:
+            logger.error(f"Failed to create HTTP session: {e}")
+            self._retry_count += 1
+            if self._retry_count < 3:
+                await asyncio.sleep(min(2 ** self._retry_count, 10))
+                await self._create_session()
+            else:
+                raise
+
+    async def close(self):
+        if self._session and not self._session.closed:
+            try:
+                await self._session.close()
+                logger.info("HTTP session closed")
+            except Exception as e:
+                logger.error(f"Error closing HTTP session: {e}")
 
 @dataclass
 class MatchData:
@@ -461,22 +702,50 @@ def get_matches_by_player(steam_id: str, limit: int = 10) -> List[MatchData]:
    return player_matches[:limit]
 
 
+async def fetch_json(url: str, max_retries: int = 3) -> dict:
+    """Enhanced fetch with better error handling and retries"""
+    last_error = None
 
+    for attempt in range(max_retries):
+        try:
+            session = await connection_manager.get_session()
 
+            # Add small delay between retries
+            if attempt > 0:
+                wait_time = min(2 ** attempt, 10)
+                await asyncio.sleep(wait_time)
 
-async def fetch_json(url: str) -> dict:
-    try:
-        session = await connection_manager.get_session()
-        async with session.get(url) as response:
-            if response.status == 200:
-                data = await response.json()
-                return data
-            else:
-                logger.warning(f"HTTP {response.status} for {url}")
-                return {}
-    except Exception as e:
-        logger.error(f"HTTP request failed: {e}")
-        return {}
+            async with session.get(url) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return data
+                elif response.status == 429:
+                    # Rate limited
+                    retry_after = response.headers.get('Retry-After', '60')
+                    wait_time = min(int(retry_after) if retry_after.isdigit() else 60, 120)
+                    logger.warning(f"Rate limited, waiting {wait_time}s")
+                    await asyncio.sleep(wait_time)
+                    continue
+                elif response.status >= 500:
+                    # Server error - retry
+                    logger.warning(f"Server error {response.status} for {url}, attempt {attempt + 1}")
+                    continue
+                else:
+                    logger.warning(f"HTTP {response.status} for {url}")
+                    return {}
+
+        except asyncio.TimeoutError as e:
+            last_error = e
+            logger.warning(f"Timeout on attempt {attempt + 1} for {url}")
+        except aiohttp.ClientError as e:
+            last_error = e
+            logger.warning(f"Client error on attempt {attempt + 1} for {url}: {e}")
+        except Exception as e:
+            last_error = e
+            logger.error(f"Unexpected error on attempt {attempt + 1} for {url}: {e}")
+
+    logger.error(f"All {max_retries} attempts failed for {url}. Last error: {last_error}")
+    return {}
 
 def get_race_specific_matchups(target_race: str, min_elo: int = None, max_elo: int = None) -> dict:
    race_stats = {
@@ -544,6 +813,33 @@ def get_race_specific_matchups(target_race: str, min_elo: int = None, max_elo: i
 
 
    return race_stats
+
+
+async def safe_response(interaction: discord.Interaction, content=None, embed=None, ephemeral=False):
+    """Safely respond to interactions with timeout handling"""
+    try:
+        if not interaction.response.is_done():
+            if embed:
+                await interaction.response.send_message(embed=embed, ephemeral=ephemeral)
+            else:
+                await interaction.response.send_message(content, ephemeral=ephemeral)
+            return True
+        else:
+            if embed:
+                await interaction.followup.send(embed=embed, ephemeral=ephemeral)
+            else:
+                await interaction.followup.send(content, ephemeral=ephemeral)
+            return True
+    except discord.NotFound:
+        print(f"Interaction {interaction.id} has expired")
+        return False
+    except discord.HTTPException as e:
+        print(f"HTTP error responding to interaction: {e}")
+        return False
+    except Exception as e:
+        print(f"Unexpected error responding to interaction: {e}")
+        return False
+
 
 async def fetch_personal_stats_by_steamid(steam_id: str) -> dict:
     profile_name = f'"/steam/{steam_id}"'
@@ -1523,190 +1819,86 @@ async def bulk_scan_for_matches(update_progress):
             lb_players_processed = 0
             lb_aliases_stored = 0
 
-            while True:
-                try:
-                    lb_data = await fetch_leaderboard_data(lb_id, start, count)
-                    stat_groups = lb_data.get('statGroups', [])
+            try:
+                while start <= 1000:  # Limit to prevent infinite loops
+                    try:
+                        lb_data = await fetch_leaderboard_data(lb_id, start, count)
+                        stat_groups = lb_data.get('statGroups', [])
 
-                    if not stat_groups:
-                        break
+                        if not stat_groups:
+                            break
 
-                    for stat_group in stat_groups:
-                        try:
-                            if not stat_group.get('members'):
-                                continue
-
-                            member = stat_group['members'][0]
-                            member_name = member.get('name', '')
-
-                            if not member_name.startswith('/steam/'):
-                                continue
-
-                            steam_id = member_name.replace('/steam/', '')
-                            if not validate_steamid(steam_id):
-                                continue
-
-                            alias = member.get('alias', 'Unknown Player')
-
-                            is_new_player = steam_id not in player_aliases
-                            if is_new_player:
-                                results['new_players_found'] += 1
-
-                            if store_player_alias(steam_id, alias, save_immediately=False):
-                                lb_aliases_stored += 1
-                                results['new_aliases_stored'] += 1
-
+                        batch_processed = 0
+                        for stat_group in stat_groups:
                             try:
-                                pre_match_count = get_stored_match_count()
-                                await extract_elos(steam_id, batch_mode=True)
-                                post_match_count = get_stored_match_count()
-                                matches_added = post_match_count - pre_match_count
-                                results['total_matches_added'] += matches_added
-                                results['total_players_processed'] += 1
-                                lb_players_processed += 1
+                                if not stat_group.get('members'):
+                                    continue
 
-                            except Exception as player_error:
-                                print(f"Error processing player {steam_id}: {player_error}")
+                                member = stat_group['members'][0]
+                                member_name = member.get('name', '')
+
+                                if not member_name.startswith('/steam/'):
+                                    continue
+
+                                steam_id = member_name.replace('/steam/', '')
+                                if not validate_steamid(steam_id):
+                                    continue
+
+                                alias = member.get('alias', 'Unknown Player')
+
+                                is_new_player = steam_id not in player_aliases
+                                if is_new_player:
+                                    results['new_players_found'] += 1
+
+                                if store_player_alias(steam_id, alias, save_immediately=False):
+                                    lb_aliases_stored += 1
+                                    results['new_aliases_stored'] += 1
+
+                                try:
+                                    pre_match_count = get_stored_match_count()
+                                    await extract_elos(steam_id, batch_mode=True)
+                                    post_match_count = get_stored_match_count()
+                                    matches_added = post_match_count - pre_match_count
+                                    results['total_matches_added'] += matches_added
+                                    results['total_players_processed'] += 1
+                                    lb_players_processed += 1
+                                    batch_processed += 1
+
+                                except Exception as player_error:
+                                    print(f"Error processing player {steam_id}: {player_error}")
+                                    results['errors'] += 1
+
+                                # Yield control every few players
+                                if batch_processed % 10 == 0:
+                                    await asyncio.sleep(0.1)
+
+                            except Exception:
                                 results['errors'] += 1
+                                continue
 
-                            await asyncio.sleep(0.05)
-                        except Exception:
-                            results['errors'] += 1
-                            continue
+                        # Update progress every batch
+                        await update_progress(f"📊 {faction_name}: Processed {lb_players_processed} players, {lb_aliases_stored} new aliases")
 
-                    await update_progress(f"📊 {faction_name}: Processed {lb_players_processed} players, {lb_aliases_stored} new aliases")
+                        if len(stat_groups) < count:
+                            break
+                        start += count
 
-                    if len(stat_groups) < count:
+                    except Exception as e:
+                        print(f"Error in leaderboard batch: {e}")
+                        results['errors'] += 1
                         break
-                    start += count
-                    if start > 1000:
-                        break
 
-                except Exception:
-                    results['errors'] += 1
-                    break
+            except Exception as e:
+                print(f"Error processing leaderboard {faction_name}: {e}")
+                results['errors'] += 1
 
             results['leaderboard_results'][faction_name] = lb_players_processed
-            await asyncio.sleep(0.1)
-            gc.collect()
+            await asyncio.sleep(0.1)  # Brief pause between leaderboards
+            gc.collect()  # Force garbage collection
 
         await update_progress(f"✅ Match scan complete! Processed {results['total_players_processed']} players")
         save_match_data_to_file()
         save_aliases_to_file()
-
-    except Exception as e:
-        await update_progress(f"❌ Critical error: {str(e)}")
-        print(f"Critical error in bulk_scan_for_matches: {e}")
-        results['errors'] += 1
-
-    return results
-async def bulk_scan_for_matches(update_progress):
-    results = {
-        'total_players_processed': 0,
-        'new_players_found': 0,
-        'total_matches_added': 0,
-        'errors': 0,
-        'leaderboard_results': {}
-    }
-
-    known_leaderboards = [
-        {'id': 1, 'name': 'Chaos 1v1'},
-        {'id': 2, 'name': 'Dark Eldar 1v1'},
-        {'id': 3, 'name': 'Eldar 1v1'},
-        {'id': 4, 'name': 'Guard 1v1'},
-        {'id': 5, 'name': 'Necron 1v1'},
-        {'id': 6, 'name': 'Orc 1v1'},
-        {'id': 7, 'name': 'Sisters 1v1'},
-        {'id': 8, 'name': 'Space Marine 1v1'},
-        {'id': 9, 'name': 'Tau 1v1'}
-    ]
-
-    try:
-        await update_progress(f"🔍 Scanning {len(known_leaderboards)} leaderboards for match data")
-
-        for lb_index, leaderboard in enumerate(known_leaderboards, 1):
-            lb_id = leaderboard['id']
-            lb_name = leaderboard['name']
-
-            await update_progress(f"📊 Scanning {lb_name} ({lb_index}/{len(known_leaderboards)})")
-
-            faction_name = FACTIONS.get(lb_id, f"Faction {lb_id}")
-            results['leaderboard_results'][faction_name] = 0
-
-            start = 1
-            count = 200
-            lb_players_processed = 0
-
-            while True:
-                try:
-                    lb_data = await fetch_leaderboard_data(lb_id, start, count)
-                    stat_groups = lb_data.get('statGroups', [])
-
-                    if not stat_groups:
-                        break
-
-                    for stat_group in stat_groups:
-                        try:
-                            if not stat_group.get('members'):
-                                continue
-
-                            member = stat_group['members'][0]
-                            member_name = member.get('name', '')
-
-                            if not member_name.startswith('/steam/'):
-                                continue
-
-                            steam_id = member_name.replace('/steam/', '')
-                            if not validate_steamid(steam_id):
-                                continue
-
-                            alias = member.get('alias', 'Unknown Player')
-                            is_new_player = steam_id not in player_aliases
-                            if is_new_player:
-                                results['new_players_found'] += 1
-
-                            player_aliases[steam_id] = alias
-
-                            try:
-                                pre_match_count = get_stored_match_count()
-                                await extract_elos(steam_id, batch_mode=True)
-                                post_match_count = get_stored_match_count()
-
-                                matches_added = post_match_count - pre_match_count
-                                results['total_matches_added'] += matches_added
-                                results['total_players_processed'] += 1
-                                lb_players_processed += 1
-
-                            except Exception as player_error:
-                                print(f"Error processing player {steam_id}: {player_error}")
-                                results['errors'] += 1
-
-                            await asyncio.sleep(0.05)
-
-                        except Exception:
-                            results['errors'] += 1
-                            continue
-
-                    await update_progress(f"📊 {faction_name}: Processed {lb_players_processed} players")
-
-                    if len(stat_groups) < count:
-                        break
-
-                    start += count
-
-                    if start > 1000:
-                        break
-
-                except Exception:
-                    results['errors'] += 1
-                    break
-
-            results['leaderboard_results'][faction_name] = lb_players_processed
-            await asyncio.sleep(0.1)
-            gc.collect()
-
-        await update_progress(f"✅ Match scan complete! Processed {results['total_players_processed']} players")
-        save_match_data_to_file()
 
     except Exception as e:
         await update_progress(f"❌ Critical error: {str(e)}")
@@ -1721,19 +1913,23 @@ async def fetch_leaderboard_data(leaderboard_id: int, start: int = 1, count: int
     return await fetch_json(url)
 
 
-
 @app_commands.command(name="factions", description="Show live faction stats (winrate, rank, ELO) for a player")
 @app_commands.describe(player="Enter a 17-digit SteamID64 or player alias/name")
 async def slash_factions(interaction: discord.Interaction, player: str):
-    await interaction.response.defer()
+    try:
+        await interaction.response.defer()
+    except discord.NotFound:
+        print(f"Interaction {interaction.id} expired before deferring")
+        return
+    except Exception as e:
+        print(f"Error deferring interaction: {e}")
+        return
 
     personal_stats_data = None
     steam_id = None
     alias = "Unknown Player"
 
-
     if validate_steamid(player):
-
         steam_id = player
         personal_stats_data = await fetch_personal_stats_by_steamid(steam_id)
         if personal_stats_data:
@@ -1742,6 +1938,7 @@ async def slash_factions(interaction: discord.Interaction, player: str):
         personal_stats_data = await fetch_personal_stats_by_alias(player)
         if personal_stats_data:
             steam_id, alias = extract_player_info_from_personal_stats(personal_stats_data)
+
     if not personal_stats_data:
         resolved_steamid, resolved_alias, similar_matches = resolve_player_identifier(player)
         if resolved_steamid:
@@ -1752,24 +1949,25 @@ async def slash_factions(interaction: discord.Interaction, player: str):
 
     if not personal_stats_data or not steam_id:
         if not validate_steamid(player):
-            await interaction.followup.send(
+            await safe_response(
+                interaction,
                 f"❌ Player '{player}' not found. Make sure the alias is spelled correctly or use a valid 17-digit SteamID64."
             )
         else:
-            await interaction.followup.send(f"⚠️ No stats found for SteamID {player}.")
+            await safe_response(interaction, f"⚠️ No stats found for SteamID {player}.")
         return
 
     player_aliases[steam_id] = alias
 
     leaderboard_stats = personal_stats_data.get('leaderboardStats', [])
     if not leaderboard_stats:
-        await interaction.followup.send(f"⚠️ No faction stats found for {alias}.")
+        await safe_response(interaction, f"⚠️ No faction stats found for {alias}.")
         return
 
     faction_data = process_leaderboard_stats(leaderboard_stats)
 
     if not faction_data:
-        await interaction.followup.send(f"⚠️ No 1v1 faction data found for {alias}.")
+        await safe_response(interaction, f"⚠️ No 1v1 faction data found for {alias}.")
         return
 
     embed = create_embed_base("Live Faction Statistics", steam_id, alias, 0x2ECC71)
@@ -1777,7 +1975,6 @@ async def slash_factions(interaction: discord.Interaction, player: str):
     for lb_id, name in FACTIONS.items():
         if lb_id in faction_data:
             data = faction_data[lb_id]
-
             rank_text = f"Rank #{data['rank']}" if data['rank'] is not None else "Unranked"
 
             field_value = (
@@ -1786,17 +1983,12 @@ async def slash_factions(interaction: discord.Interaction, player: str):
                 f"**Games:** {data['total_games']}"
             )
 
-            embed.add_field(
-                name=name,
-                value=field_value,
-                inline=True
-            )
+            embed.add_field(name=name, value=field_value, inline=True)
         else:
             embed.add_field(name=name, value="No data", inline=True)
 
     embed.set_footer(text="Live data from Relic API")
-    await interaction.followup.send(embed=embed)
-
+    await safe_response(interaction, embed=embed)
 
 @app_commands.command(name="1v1winrate", description="Show overall 1v1 winrate for a player")
 @app_commands.describe(player="Enter a 17-digit SteamID64 or player alias/name")
@@ -2107,10 +2299,19 @@ async def slash_latest_match(interaction: discord.Interaction, player: str):
 )
 async def slash_match_history(interaction: discord.Interaction, player: str, limit: int = 5):
     if not 1 <= limit <= 10:
-        await interaction.response.send_message("⚠️ Limit must be between 1 and 10.", ephemeral=True)
+        await safe_response(interaction, "⚠️ Limit must be between 1 and 10.", ephemeral=True)
         return
 
-    await interaction.response.defer()
+    # Defer immediately and safely
+    try:
+        await interaction.response.defer()
+    except discord.NotFound:
+        print(f"Interaction {interaction.id} expired before deferring")
+        return
+    except Exception as e:
+        print(f"Error deferring interaction: {e}")
+        return
+
     steamid, alias, similar_matches = resolve_player_identifier(player)
     match_data = None
 
@@ -2120,106 +2321,6 @@ async def slash_match_history(interaction: discord.Interaction, player: str, lim
         match_data = await fetch_match_history_alias(player)
 
         if match_data:
-            profiles = match_data.get('profiles', [])
-            for profile in profiles:
-                profile_name = profile.get('name', '')
-                if profile_name.startswith('/steam/'):
-                    steamid = profile_name.replace('/steam/', '')
-                    alias = profile.get('alias', player)
-                    player_aliases[steamid] = alias
-                    break
-
-        if not match_data and similar_matches:
-            suggestion_text = "\n".join(f"• {match}" for match in similar_matches)
-            await interaction.followup.send(
-                f"⚠️ Player '{player}' not found. Did you mean one of these?\n```\n{suggestion_text}\n```"
-            )
-            return
-    else:
-        steamid = player
-        match_data = await fetch_match_history(steamid)
-    if not match_data:
-        await interaction.followup.send(f"⚠️ No match history found for {player}.")
-        return
-
-    await extract_elos(steamid)
-
-    profiles = {p['profile_id']: p['alias'] for p in match_data.get('profiles', [])}
-    matches = filter_1v1_matches(match_data.get('matchHistoryStats', []))
-
-    if not matches:
-        await interaction.followup.send(f"⚠️ No 1v1 matches found for {alias}.")
-        return
-
-    matches_to_show = matches[:limit]
-
-
-    for profile_data in match_data.get('profiles', []):
-        if profile_data.get('name') == f"/steam/{steamid}":
-            alias = profile_data.get('alias', alias)
-            player_aliases[steamid] = alias
-            break
-
-    embed = create_embed_base("Recent 1v1 Match History", steamid, alias, 0x3498DB)
-
-
-    for i, match in enumerate(matches_to_show, 1):
-        match_id = match['id']
-        map_name = match['mapname']
-        end_time = datetime.fromtimestamp(match['completiontime']).strftime('%m/%d %H:%M')
-
-        results_map = {
-            result['profile_id']: result['resulttype']
-            for result in match['matchhistoryreportresults']
-        }
-
-        players_info = []
-        for member in match['matchhistorymember']:
-            profile_id = member['profile_id']
-            player_alias = profiles.get(profile_id, f"ID {profile_id}")
-            race_name = RACE_MAP.get(member['race_id'], f"Race ID {member['race_id']}")
-            old_rating = member['oldrating']
-            new_rating = member['newrating']
-            rating_change = new_rating - old_rating
-            result_type = results_map.get(profile_id)
-
-            outcome_emoji = "🏆" if result_type == 1 else "💀" if result_type == 0 else "❓"
-            rating_emoji = "📈" if rating_change > 0 else "📉" if rating_change < 0 else "➡️"
-
-            player_line = f"{outcome_emoji} **{player_alias}** ({race_name})\n{rating_emoji} {old_rating} → {new_rating} ({rating_change:+d})"
-            players_info.append(player_line)
-
-        match_summary = f"**Map:** {map_name} | **Date:** {end_time}\n" + "\n".join(players_info)
-        embed.add_field(name=f"⚔️ Match #{match_id}", value=match_summary, inline=False)
-
-    await interaction.followup.send(embed=embed)
-
-
-@app_commands.command(name="matchhistory", description="Show recent 1v1 match history for a player")
-@app_commands.describe(
-    player="Enter a 17-digit SteamID64 or player alias/name",
-    limit="Number of matches to show (1-10, default: 5)"
-)
-async def slash_match_history(interaction: discord.Interaction, player: str, limit: int = 5):
-    if not 1 <= limit <= 10:
-        await interaction.response.send_message("⚠️ Limit must be between 1 and 10.", ephemeral=True)
-        return
-
-    await interaction.response.defer()
-
-
-    steamid, alias, similar_matches = resolve_player_identifier(player)
-    match_data = None
-
-    if steamid:
-
-        match_data = await fetch_match_history(steamid)
-    elif not validate_steamid(player):
-
-        match_data = await fetch_match_history_alias(player)
-
-        if match_data:
-
             profiles = match_data.get('profiles', [])
             for profile in profiles:
                 profile_alias = profile.get('alias', '')
@@ -2227,10 +2328,8 @@ async def slash_match_history(interaction: discord.Interaction, player: str, lim
                 if profile_name.startswith('/steam/') and profile_alias.lower() == player.lower():
                     steamid = profile_name.replace('/steam/', '')
                     alias = profile_alias
-
                     player_aliases[steamid] = alias
                     break
-
 
             if not steamid:
                 for profile in profiles:
@@ -2238,14 +2337,13 @@ async def slash_match_history(interaction: discord.Interaction, player: str, lim
                     if profile_name.startswith('/steam/'):
                         steamid = profile_name.replace('/steam/', '')
                         alias = profile.get('alias', player)
-
                         player_aliases[steamid] = alias
                         break
 
-
         if not match_data and similar_matches:
             suggestion_text = "\n".join(f"• {match}" for match in similar_matches)
-            await interaction.followup.send(
+            await safe_response(
+                interaction,
                 f"⚠️ Player '{player}' not found. Did you mean one of these?\n```\n{suggestion_text}\n```"
             )
             return
@@ -2254,22 +2352,25 @@ async def slash_match_history(interaction: discord.Interaction, player: str, lim
         match_data = await fetch_match_history(steamid)
 
     if not match_data:
-        await interaction.followup.send(f"⚠️ No match history found for {player}.")
+        await safe_response(interaction, f"⚠️ No match history found for {player}.")
         return
 
-
-    await extract_elos(steamid)
+    # Extract elos but don't block on it
+    try:
+        await extract_elos(steamid)
+    except Exception as e:
+        print(f"Error extracting elos for {steamid}: {e}")
 
     profiles = {p['profile_id']: p['alias'] for p in match_data.get('profiles', [])}
     matches = filter_1v1_matches(match_data.get('matchHistoryStats', []))
 
     if not matches:
-        await interaction.followup.send(f"⚠️ No 1v1 matches found for {alias}.")
+        await safe_response(interaction, f"⚠️ No 1v1 matches found for {alias}.")
         return
 
     matches_to_show = matches[:limit]
 
-
+    # Update alias
     for profile_data in match_data.get('profiles', []):
         if profile_data.get('name') == f"/steam/{steamid}":
             alias = profile_data.get('alias', alias)
@@ -2277,7 +2378,6 @@ async def slash_match_history(interaction: discord.Interaction, player: str, lim
             break
 
     embed = create_embed_base("Recent 1v1 Match History", steamid, alias, 0x3498DB)
-
 
     for i, match in enumerate(matches_to_show, 1):
         match_id = match['id']
@@ -2308,43 +2408,25 @@ async def slash_match_history(interaction: discord.Interaction, player: str, lim
         match_summary = f"**Map:** {map_name} | **Date:** {end_time}\n" + "\n".join(players_info)
         embed.add_field(name=f"⚔️ Match #{match_id}", value=match_summary, inline=False)
 
-    await interaction.followup.send(embed=embed)
-
-
-@app_commands.command(name="debug_race_mapping", description="[ADMIN] Show race mapping and stored data")
-async def debug_race_mapping(interaction: discord.Interaction):
-    await interaction.response.defer()
-
-    race_counts = defaultdict(int)
-    for match in stored_matches.values():
-        race_counts[match.player1_race] += 1
-        race_counts[match.player2_race] += 1
-        race_counts[match.winner_race] += 1
-
-    embed = discord.Embed(title="Race Names in Database", color=0xFF0000)
-
-    stored_races = []
-    for race_name, count in sorted(race_counts.items(), key=lambda x: x[1], reverse=True):
-        stored_races.append(f"{race_name}: {count} appearances")
-
-    embed.add_field(
-        name="All Race Names Found",
-        value="\n".join(stored_races),
-        inline=False
-    )
-
-    await interaction.followup.send(embed=embed)
+    await safe_response(interaction, embed=embed)
 
 
 @app_commands.command(name="scanmatches", description="[ADMIN] Scan leaderboards to collect match data")
 @app_commands.describe(passcode="Admin passcode required")
 async def slash_scan_matches(interaction: discord.Interaction, passcode: str):
-    # Defer immediately to prevent timeout
-    await interaction.response.defer()
-
-    # Check passcode after deferring
+    # Check passcode immediately
     if passcode != ADMIN_PASSCODE:
-        await interaction.followup.send("❌ Invalid passcode.", ephemeral=True)
+        await safe_response(interaction, "❌ Invalid passcode.", ephemeral=True)
+        return
+
+    # Defer immediately to prevent timeout
+    try:
+        await interaction.response.defer()
+    except discord.NotFound:
+        print(f"Interaction {interaction.id} expired before deferring")
+        return
+    except Exception as e:
+        print(f"Error deferring interaction: {e}")
         return
 
     # Create initial embed
@@ -2352,20 +2434,43 @@ async def slash_scan_matches(interaction: discord.Interaction, passcode: str):
     embed.description = "Scanning leaderboards to discover players and collect match histories..."
     embed.add_field(name="Status", value="Initializing...", inline=False)
 
-    message = await interaction.followup.send(embed=embed)
+    try:
+        message = await interaction.followup.send(embed=embed)
+    except discord.NotFound:
+        print("Cannot send initial message - interaction expired")
+        return
+    except Exception as e:
+        print(f"Error sending initial message: {e}")
+        return
 
-    # Progress update function
+    start_time = datetime.now()
+    last_update = datetime.now()
+
+    # Enhanced progress update function with better error handling
     async def update_progress(status_text):
+        nonlocal last_update
+        now = datetime.now()
+
+        # Rate limit updates to every 3 seconds
+        if (now - last_update).total_seconds() < 3:
+            return
+
         try:
             embed.set_field_at(0, name="Status", value=status_text, inline=False)
             await message.edit(embed=embed)
+            last_update = now
+        except discord.NotFound:
+            print("Progress message expired")
+        except discord.HTTPException as e:
+            if e.status == 404:
+                print("Progress message not found")
+            else:
+                print(f"HTTP error updating progress: {e}")
         except Exception as e:
             print(f"Error updating progress: {e}")
 
-    start_time = datetime.now()
-
     try:
-        # Run the scan
+        # Run the enhanced scan
         results = await bulk_scan_for_matches(update_progress)
 
         end_time = datetime.now()
@@ -2405,28 +2510,27 @@ async def slash_scan_matches(interaction: discord.Interaction, passcode: str):
             inline=True
         )
 
-        players_per_second = results['total_players_processed'] / duration if duration > 0 else 0
-        matches_per_second = results['total_matches_added'] / duration if duration > 0 else 0
-
-        results_embed.add_field(
-            name="⚡ Performance",
-            value=f"**Players/Second:** {players_per_second:.2f}\n"
-                  f"**Matches/Second:** {matches_per_second:.2f}",
-            inline=True
-        )
-
         results_embed.set_footer(text=f"Scan completed at {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
 
-        await message.edit(embed=results_embed)
+        try:
+            await message.edit(embed=results_embed)
+        except discord.NotFound:
+            # Message expired, try to send new one
+            await safe_response(interaction, embed=results_embed)
+        except Exception as e:
+            print(f"Error updating final results: {e}")
 
     except Exception as e:
         error_embed = discord.Embed(title="❌ Match Scan Failed", color=0xFF0000)
         error_embed.description = f"An error occurred during the scan: {str(e)}"
         error_embed.add_field(name="Error Details", value=f"```{str(e)[:1000]}```", inline=False)
+
         try:
             await message.edit(embed=error_embed)
-        except:
-            await interaction.followup.send(embed=error_embed)
+        except discord.NotFound:
+            await safe_response(interaction, embed=error_embed)
+        except Exception as edit_error:
+            print(f"Error sending error message: {edit_error}")
 
 
 
@@ -2472,126 +2576,6 @@ async def slash_topelo(interaction: discord.Interaction, limit: int = 10, min_ga
         await interaction.followup.send(f"An error occurred while fetching top ELO data: {str(e)}", ephemeral=True)
 
 
-# Additional error
-@bot.tree.error
-async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    """Global error handler for slash commands"""
-
-    if isinstance(error, app_commands.CommandOnCooldown):
-        await interaction.response.send_message(
-            f"Command is on cooldown. Try again in {error.retry_after:.2f} seconds.",
-            ephemeral=True
-        )
-    elif isinstance(error, app_commands.CommandInvokeError):
-        print(f"Command error: {error}")
-
-        # Try to respond
-        try:
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    "An error occurred while processing your command. Please try again.",
-                    ephemeral=True
-                )
-            else:
-                await interaction.followup.send(
-                    "An error occurred while processing your command. Please try again.",
-                    ephemeral=True
-                )
-        except Exception as e:
-            print(f"Failed to send error message: {e}")
-    else:
-        print(f"Unhandled command error: {error}")
-
-
-class ConnectionManager:
-    __slots__ = ['_session', '_lock', '_retry_count']
-
-    def __init__(self):
-        self._session = None
-        self._lock = asyncio.Lock()
-        self._retry_count = 0
-
-    async def get_session(self):
-        if self._session is None or self._session.closed:
-            async with self._lock:
-                if self._session is None or self._session.closed:
-                    await self._create_session()
-        return self._session
-
-    async def _create_session(self):
-        if self._session and not self._session.closed:
-            try:
-                await self._session.close()
-            except Exception as e:
-                print(f"Error closing session: {e}")
-
-        timeout = aiohttp.ClientTimeout(total=30, connect=10)
-        connector = aiohttp.TCPConnector(
-            limit=10,
-            limit_per_host=5,
-            ttl_dns_cache=300,
-            use_dns_cache=True,
-            enable_cleanup_closed=True,
-            keepalive_timeout=30
-        )
-
-        try:
-            self._session = aiohttp.ClientSession(
-                timeout=timeout,
-                connector=connector,
-                headers={'User-Agent': 'Discord-Bot/2.0'}
-            )
-            self._retry_count = 0
-            logger.info("Created new HTTP session")
-        except Exception as e:
-            logger.error(f"Failed to create HTTP session: {e}")
-            self._retry_count += 1
-            if self._retry_count < 3:
-                await asyncio.sleep(1)
-                await self._create_session()
-            else:
-                raise
-
-    async def close(self):
-        if self._session and not self._session.closed:
-            try:
-                await self._session.close()
-                logger.info("HTTP session closed")
-            except Exception as e:
-                logger.error(f"Error closing HTTP session: {e}")
-
-
-
-async def fetch_json(url: str, max_retries: int = 3) -> dict:
-    for attempt in range(max_retries):
-        try:
-            session = await connection_manager.get_session()
-            async with session.get(url) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    return data
-                elif response.status == 429:
-                    wait_time = 2 ** attempt
-                    logger.warning(f"Rate limited, waiting {wait_time}s before retry {attempt + 1}")
-                    await asyncio.sleep(wait_time)
-                    continue
-                else:
-                    logger.warning(f"HTTP {response.status} for {url}")
-                    if attempt == max_retries - 1:
-                        return {}
-        except asyncio.TimeoutError:
-            logger.warning(f"Timeout on attempt {attempt + 1} for {url}")
-            if attempt == max_retries - 1:
-                return {}
-        except Exception as e:
-            logger.error(f"HTTP request failed on attempt {attempt + 1}: {e}")
-            if attempt == max_retries - 1:
-                return {}
-
-
-        await asyncio.sleep(1)
-
-    return {}
 
 
 @app_commands.command(name="matchstats", description="Show statistics about stored match data")
@@ -3072,7 +3056,9 @@ if __name__ == "__main__":
     bot.tree.add_command(slash_help)
     bot.tree.add_command(slash_race_leaderboard)
     bot.tree.add_command(slash_topelo)
+
     try:
         bot.run(TOKEN)
     finally:
         asyncio.run(cleanup())
+
